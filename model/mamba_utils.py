@@ -53,6 +53,38 @@ def window_partition(x, window_size):
     windows = x.permute(0, 1, 3, 5, 2, 4, 6,7).contiguous().view(-1,window_size, window_size, window_size, C)
     return windows
 
+class PositionalEncoding3D(nn.Module):
+    def __init__(self, d_model, max_d=64, max_h=64, max_w=64):
+        super(PositionalEncoding3D, self).__init__()
+
+        pe = torch.zeros(d_model, max_d, max_h, max_w)
+        d_model = int(d_model / 3)
+        div_term = torch.exp(torch.arange(0., d_model, 2) * -(torch.log(torch.tensor(10000.0)) / d_model))
+
+        pos_d = torch.arange(0., max_d).unsqueeze(1)
+        pos_h = torch.arange(0., max_h).unsqueeze(1)
+        pos_w = torch.arange(0., max_w).unsqueeze(1)
+
+        pe[0:d_model:2, :, :, :] = torch.sin(pos_d * div_term).transpose(0, 1).unsqueeze(2).unsqueeze(3)
+        pe[1:d_model:2, :, :, :] = torch.cos(pos_d * div_term).transpose(0, 1).unsqueeze(2).unsqueeze(3)
+
+        pe[d_model:2*d_model:2, :, :, :] = torch.sin(pos_h * div_term).transpose(0, 1).unsqueeze(1).unsqueeze(3)
+        pe[d_model+1:2*d_model:2, :, :, :] = torch.cos(pos_h * div_term).transpose(0, 1).unsqueeze(1).unsqueeze(3)
+
+        pe[2*d_model::2, :, :, :] = torch.sin(pos_w * div_term).transpose(0, 1).unsqueeze(1).unsqueeze(2)
+        pe[2*d_model+1::2, :, :, :] = torch.cos(pos_w * div_term).transpose(0, 1).unsqueeze(1).unsqueeze(2)
+
+        pe = pe.unsqueeze(0)  # Add batch dimension
+        self.register_buffer('pe', pe)
+    def forward(self, x):
+        """
+        
+        Args:
+            x: (B, C, D, H, W)
+        """
+        x = x + self.pe[:, :, :x.size(2), :x.size(3), :x.size(4)]
+        return x
+    
 def window_reverse(windows, window_size, D, H, W):
     """
     Args:
