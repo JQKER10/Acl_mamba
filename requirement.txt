@@ -3,3 +3,4 @@ triton
 timm
 mamba-ssm
 einops
+monai
