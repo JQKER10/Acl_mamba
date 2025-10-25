@@ -20,6 +20,8 @@ class Mlp(nn.Module):
         x = self.fc2(x)
         x = self.drop(x)
         return x
+    
+
 class PatchEmbedding3d(nn.Module):
     def __init__(self, d_model, patch_size=(2,4,4), in_chans=1, conv_bias=True, norm_layer=None, device=None, dtype=None):
         super().__init__()
@@ -52,6 +54,7 @@ def window_partition(x, window_size):
     x = x.view(B, D//window_size, window_size, H // window_size, window_size, W // window_size, window_size, C)
     windows = x.permute(0, 1, 3, 5, 2, 4, 6,7).contiguous().view(-1,window_size, window_size, window_size, C)
     return windows
+
 
 class PositionalEncoding3D(nn.Module):
     def __init__(self, d_model, max_d=64, max_h=64, max_w=64):
@@ -101,6 +104,41 @@ def window_reverse(windows, window_size, D, H, W):
     windows = windows.view(B, D // window_size, H // window_size, W // window_size, window_size, window_size, window_size, -1)
     x = windows.permute(0, 1, 4, 2, 5, 3, 6, 7).contiguous().view(B, D, H, W, -1)
     return x
+
+
+class PatchMerging3D(nn.Module):
+    def __init__(self, input_dim, norm_layer=nn.LayerNorm, device=None, dtype=None):
+        super().__init__()
+        factory_kwargs = {"device": device, "dtype": dtype}
+        self.input_dim = input_dim
+        self.reduction = nn.Linear(8 * input_dim, 2 * input_dim, bias=False, **factory_kwargs)
+        self.norm = norm_layer(8 * input_dim)
+    def forward(self, x, D, H, W):
+        B, L, C = x.shape
+        assert L == D * H * W, "input feature has wrong size"
+
+        x = x.view(B, D, H, W, C)
+
+        # padding
+        pad_input = (D % 2 == 1) or (H % 2 == 1) or (W % 2 == 1)
+        if pad_input:
+            x = nn.functional.pad(x, (0, 0, 0, W % 2, 0, H % 2, 0, D % 2))
+
+        D = x.shape[1]
+        H = x.shape[2]
+        W = x.shape[3]
+
+        x0 = x[:, 0::2, 0::2, 0::2, :]  # B D/2 H/2 W/2 C
+        x1 = x[:, 0::2, 0::2, 1::2, :]  # B D/2 H/2 W/2 C
+        x2 = x[:, 0::2, 1::2, 0::2, :]  # B D/2 H/2 W/2 C
+        x3 = x[:, 0::2, 1::2, 1::2, :]  # B D/2 H/2 W/2 C
+        x4 = x[:, 1::2, 0::2, 0::2, :]  # B D/2 H/2 W/2 C
+        x5 = x[:, 1::2, 0::2, 1::2, :]  # B D/2 H/2 W/2 C
+        x6 = x[:, 1::2, 1::2, 0::2, :]  # B D/2 H/2 W/2 C
+        x7 = x[:, 1::2, 1::2, 1::2, :]  # B D/2 H/2 W/2 C
+
+        x = torch.cat([x0, x1, x2, x3, x4, x5, x6, x7], -1)  # B D/2 H/2 W/2 8*C
+        x = x.view(B, -1, 8 * C)  
 
 
 class ConvLayer(nn.Module):

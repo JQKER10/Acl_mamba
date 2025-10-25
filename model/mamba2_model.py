@@ -6,12 +6,12 @@ import math
 
 
 class SSD(nn.Module):
-   def __init__(
+    def __init__(
         self,
         d_model,
         d_conv=3, #default to 3 for 2D
         conv_init=None,
-        expand=2,
+        ssd_expand=2,
         headdim=64, #default to 64
         ngroups=1,
         A_init_range=(1, 16),
@@ -29,7 +29,6 @@ class SSD(nn.Module):
         layer_idx=None,  # Absorb kwarg for general module
         device=None,
         dtype=None,
-        linear_attn_duality=False,
         d_state = 64,
         **kwargs
     ):
@@ -38,25 +37,8 @@ class SSD(nn.Module):
         self.d_model = d_model
         self.d_conv = d_conv
         self.conv_init = conv_init
-        self.expand = expand
-        self.d_inner = int(self.expand * self.d_model)
-        self.headdim = headdim
-        self.d_state = d_state
-        if ngroups == -1:
-            ngroups = self.d_inner // self.headdim #equivalent to multi-head attention
-        self.ngroups = ngroups
-        assert self.d_inner % self.headdim == 0
-        self.nheads = self.d_inner // self.headdim
-        self.dt_limit = dt_limit
-        self.learnable_init_states = learnable_init_states
-        self.activation = activation
-        factory_kwargs = {"device": device, "dtype": dtype}
-        super().__init__()
-        self.d_model = d_model
-        self.d_conv = d_conv
-        self.conv_init = conv_init
-        self.expand = expand
-        self.d_inner = int(self.expand * self.d_model)
+        self.ssd_expand = ssd_expand
+        self.d_inner = int(self.ssd_expand * self.d_model)
         self.headdim = headdim
         self.d_state = d_state
         if ngroups == -1:
@@ -129,36 +111,32 @@ class SSD(nn.Module):
         #self.norm = RMSNormGated(self.d_inner, eps=1e-5, norm_before_gate=False, **factory_kwargs)
         self.norm = nn.LayerNorm(self.d_inner)
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
-
-        #linear attention duality
-        self.linear_attn_duality = linear_attn_duality
         self.kwargs = kwargs
     def forward(self,u,H, ):
        bcdt=self.in_proj(u)
-       B, C, 
-
+       B, C, dt =torch.split(bcdt, [2*self.d_inner, 2*self.ngroups*self.d_state, self.nheads], dim=-1)
+       B= rearrange(B, 'b (n h d) -> b n h d', n=self.nheads, h=self.headdim)
+       C= rearrange(C, 'b (g s d) -> b g s d', g=self.ngroups, s=self.d_state)
 
 class MultiKernelConv(nn.Module):
-    def __init__(self, in_channels:int, out_channels:int, kernel_sizes=[3,5,7], stride=1, padding=0, dilation=1, groups=1,
-                 bias=True, dropout=0, norm=nn.BatchNorm2d, act_func=nn.ReLU):
-        super(MultiKernelConv, self).__init__()
-        self.convs = nn.ModuleList()
-        for k in kernel_sizes:
-            conv_layer = ConvLayer(
-                in_channels,
-                out_channels,
-                kernel_size=k,
-                stride=stride,
-                padding=padding,
-                dilation=dilation,
-                groups=groups,
-                bias=bias,
-                dropout=dropout,
-                norm=norm,
-                act_func=act_func
-            )
-            self.convs.append(conv_layer)
+    def __init__(self, in_dim,out_dim,bias=True, drop_rate=0., norm_layer=nn.BatchNorm2d, act_layer=nn.ReLU):
+        super().__init__()
+        self.norm=norm_layer()
+        self.act=act_layer()
+        self.dw3=nn.Conv3d(in_dim,in_dim,kernel_size=3,padding=1,groups=in_dim,bias=bias)
+        self.dw5=nn.Conv3d(in_dim,in_dim,kernel_size=5,padding=2,groups=in_dim,bias=bias)
+        self.dw7=nn.Conv3d(in_dim,in_dim,kernel_size=7,padding=2,groups=in_dim,bias=bias)
+        self.dropout=nn.Dropout(drop_rate)
+        self.pw=nn.Conv3d(in_dim*3,out_dim,kernel_size=1,bias=bias)
+
+        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        con_outputs=torch.concat([conv(x) for conv in self.convs], dim=1)
-        con_outputs=nn.Conv3d(
-            in_channels=con_outputs.shape[1],o
+        x=self.norm(x)
+        x=self.act(x)
+        x3=self.dw3(x)
+        x5=self.dw5(x)
+        x7=self.dw7(x)
+        x=torch.cat([x3,x5,x7],dim=1)
+        x=self.dropout(x)
+        x=self.pw(x)
+        return x
