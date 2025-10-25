@@ -136,6 +136,8 @@ class SSD(nn.Module):
     def forward(self,u,H, ):
        bcdt=self.in_proj(u)
        B, C, 
+
+
 class MultiKernelConv(nn.Module):
     def __init__(self, in_channels:int, out_channels:int, kernel_sizes=[3,5,7], stride=1, padding=0, dilation=1, groups=1,
                  bias=True, dropout=0, norm=nn.BatchNorm2d, act_func=nn.ReLU):
@@ -158,4 +160,5 @@ class MultiKernelConv(nn.Module):
             self.convs.append(conv_layer)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         con_outputs=torch.concat([conv(x) for conv in self.convs], dim=1)
-        con_outputs=
+        con_outputs=nn.Conv3d(
+            in_channels=con_outputs.shape[1],o
