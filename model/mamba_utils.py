@@ -26,7 +26,8 @@ class PatchEmbedding3d(nn.Module):
     def __init__(self, d_model, patch_size=(2,4,4), in_chans=1, conv_bias=True, norm_layer=None, device=None, dtype=None):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
-        self.patch_size = to_2tuple(patch_size)
+        if isinstance(patch_size, int): 
+            self.patch_size = to_2tuple(patch_size)
         
         self.proj = nn.Conv3d(in_chans, d_model, kernel_size=(patch_size[0], patch_size[1], patch_size[2]),
                               stride=(patch_size[0], patch_size[1], patch_size[2]), bias=conv_bias, **factory_kwargs)

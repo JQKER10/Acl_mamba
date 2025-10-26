@@ -3,15 +3,17 @@ import torch
 import torch.nn as nn
 from einops import rearrange, repeat
 import math
+from .mamba_utils import PositionalEncoding3D, PatchEmbedding3d, MultiKernelConv, Mlp
 
 
 class SSD(nn.Module):
     def __init__(
         self,
         d_model,
-        d_conv=3, #default to 3 for 2D
         conv_init=None,
+        d_conv=1,
         ssd_expand=2,
+        d_state = 64,
         headdim=64, #default to 64
         ngroups=1,
         A_init_range=(1, 16),
@@ -19,17 +21,13 @@ class SSD(nn.Module):
         dt_max=0.1,
         dt_init_floor=1e-4,
         dt_limit=(0.0, float("inf")),
+        conv_bias=True,
         learnable_init_states=False,
         activation="silu", #default to silu
         bias=False,
-        conv_bias=True,
-        # Fused kernel and sharding options
-        chunk_size=256,
-        use_mem_eff_path=False, #default to False, for custom implementation
         layer_idx=None,  # Absorb kwarg for general module
         device=None,
         dtype=None,
-        d_state = 64,
         **kwargs
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
@@ -49,9 +47,6 @@ class SSD(nn.Module):
         self.dt_limit = dt_limit
         self.learnable_init_states = learnable_init_states
         self.activation = activation
-        #convert chunk_size to triton.language.int32
-        self.chunk_size = chunk_size#torch.tensor(chunk_size,dtype=torch.int32)
-        self.use_mem_eff_path = use_mem_eff_path
         self.layer_idx = layer_idx
         self.ssd_positve_dA = kwargs.get('ssd_positve_dA', True) #default to False, ablation for linear attn duality
         # Order: [z, x, B, C, dt]
@@ -140,3 +135,6 @@ class MultiKernelConv(nn.Module):
         x=self.dropout(x)
         x=self.pw(x)
         return x
+
+
+class Mamba(nn.Module):
