@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
-import torch.utils.checkpoint as checkpoint
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from einops import rearrange, repeat
+import torch.nn.functional as F
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -21,151 +21,198 @@ class Mlp(nn.Module):
         x = self.drop(x)
         return x
     
-
-class PatchEmbedding3d(nn.Module):
-    def __init__(self, d_model, patch_size=(2,4,4), in_chans=1, conv_bias=True, norm_layer=None, device=None, dtype=None):
+class StemLayer(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=3,      # dùng 3 thay vì 7
+        stride=2,
+        padding=1,
+        norm_layer=nn.BatchNorm2d,
+        act_layer=nn.ReLU,
+    ):
         super().__init__()
-        factory_kwargs = {"device": device, "dtype": dtype}
-        if isinstance(patch_size, int): 
-            self.patch_size = to_2tuple(patch_size)
-        
-        self.proj = nn.Conv3d(in_chans, d_model, kernel_size=(patch_size[0], patch_size[1], patch_size[2]),
-                              stride=(patch_size[0], patch_size[1], patch_size[2]), bias=conv_bias, **factory_kwargs)
-        
-        self.norm = norm_layer(d_model) if norm_layer else nn.Identity()
+        self.conv = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            bias=False,
+        )
+        self.bn = norm_layer(out_channels)
+        self.act = act_layer(inplace=True)
 
-    def forward(self,x):
-        x = self.proj(x)  # B, C, D, H, W
-        D, H, W = x.shape[2], x.shape[3], x.shape[4]
-        x = x.flatten(2).transpose(1, 2)  # B, D*H*W, C
-        x = self.norm(x)
-        
-        return x
-    
-def window_partition(x, window_size):
-    """
-    Args:
-        x: (B,D, H, W, C)
-        window_size (int): window size
-
-    Returns:
-        windows: (num_windows*B, window_size, window_size, C)
-    """
-    B, D, H, W, C = x.shape
-    x = x.view(B, D//window_size, window_size, H // window_size, window_size, W // window_size, window_size, C)
-    windows = x.permute(0, 1, 3, 5, 2, 4, 6,7).contiguous().view(-1,window_size, window_size, window_size, C)
-    return windows
-
-
-class PositionalEncoding3D(nn.Module):
-    def __init__(self, d_model, max_d=64, max_h=64, max_w=64):
-        super(PositionalEncoding3D, self).__init__()
-
-        pe = torch.zeros(d_model, max_d, max_h, max_w)
-        d_model = int(d_model / 3)
-        div_term = torch.exp(torch.arange(0., d_model, 2) * -(torch.log(torch.tensor(10000.0)) / d_model))
-
-        pos_d = torch.arange(0., max_d).unsqueeze(1)
-        pos_h = torch.arange(0., max_h).unsqueeze(1)
-        pos_w = torch.arange(0., max_w).unsqueeze(1)
-
-        pe[0:d_model:2, :, :, :] = torch.sin(pos_d * div_term).transpose(0, 1).unsqueeze(2).unsqueeze(3)
-        pe[1:d_model:2, :, :, :] = torch.cos(pos_d * div_term).transpose(0, 1).unsqueeze(2).unsqueeze(3)
-
-        pe[d_model:2*d_model:2, :, :, :] = torch.sin(pos_h * div_term).transpose(0, 1).unsqueeze(1).unsqueeze(3)
-        pe[d_model+1:2*d_model:2, :, :, :] = torch.cos(pos_h * div_term).transpose(0, 1).unsqueeze(1).unsqueeze(3)
-
-        pe[2*d_model::2, :, :, :] = torch.sin(pos_w * div_term).transpose(0, 1).unsqueeze(1).unsqueeze(2)
-        pe[2*d_model+1::2, :, :, :] = torch.cos(pos_w * div_term).transpose(0, 1).unsqueeze(1).unsqueeze(2)
-
-        pe = pe.unsqueeze(0)  # Add batch dimension
-        self.register_buffer('pe', pe)
     def forward(self, x):
-        """
-        
-        Args:
-            x: (B, C, D, H, W)
-        """
-        x = x + self.pe[:, :, :x.size(2), :x.size(3), :x.size(4)]
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.act(x)
         return x
-    
-def window_reverse(windows, window_size, D, H, W):
-    """
-    Args:
-        windows: (num_windows*B, window_size, window_size, window_size, C)
-        window_size (int): Window size
-        D (int): Depth of image
-        H (int): Height of image
-        W (int): Width of image
 
-    Returns:
-        x: (B, D, H, W, C)
-    """
-    B=int(windows.shape[0] / (D * H * W / window_size / window_size / window_size))
-    windows = windows.view(B, D // window_size, H // window_size, W // window_size, window_size, window_size, window_size, -1)
-    x = windows.permute(0, 1, 4, 2, 5, 3, 6, 7).contiguous().view(B, D, H, W, -1)
+
+class MultiKernelConv(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        kernel_sizes=(3, 5, 7),
+        activation=nn.SiLU,
+        bias: bool = False,
+        **factory_kwargs,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.kernel_sizes = kernel_sizes
+
+        # depthwise conv cho mỗi kernel size, giữ nguyên C
+        self.convs = nn.ModuleList([
+            nn.Conv2d(
+                in_channels=in_channels,
+                out_channels=in_channels,
+                kernel_size=k,
+                stride=1,
+                padding=k // 2,
+                groups=in_channels,
+                bias=bias,
+                **factory_kwargs,
+            )
+            for k in kernel_sizes
+        ])
+
+        self.bn = nn.BatchNorm2d(in_channels, **factory_kwargs)
+        self.act = activation()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # mỗi nhánh: (B,C,H,W) -> (B,C,H,W)
+        conv_outputs = [conv(x) for conv in self.convs]
+        x = sum(conv_outputs)         # vẫn (B,C,H,W)
+        x = self.bn(x)
+        x = self.act(x)
+        return x
+
+def channel_shuffle(x: torch.Tensor, groups: int) -> torch.Tensor:
+
+    batch_size, height, width, num_channels = x.size()
+    channels_per_group = num_channels // groups
+
+    # reshape
+    # [batch_size, num_channels, height, width] -> [batch_size, groups, channels_per_group, height, width]
+    x = x.view(batch_size, height, width, groups, channels_per_group)
+
+    x = torch.transpose(x, 3, 4).contiguous()
+
+    # flatten
+    x = x.view(batch_size, height, width, -1)
+
     return x
 
 
-class PatchMerging3D(nn.Module):
-    def __init__(self, input_dim, norm_layer=nn.LayerNorm, device=None, dtype=None):
+class Downsample(nn.Module):
+    def __init__(self, in_channels, out_channels, norm_layer=nn.BatchNorm2d):
         super().__init__()
-        factory_kwargs = {"device": device, "dtype": dtype}
-        self.input_dim = input_dim
-        self.reduction = nn.Linear(8 * input_dim, 2 * input_dim, bias=False, **factory_kwargs)
-        self.norm = norm_layer(8 * input_dim)
-    def forward(self, x, D, H, W):
-        B, L, C = x.shape
-        assert L == D * H * W, "input feature has wrong size"
-
-        x = x.view(B, D, H, W, C)
-
-        # padding
-        pad_input = (D % 2 == 1) or (H % 2 == 1) or (W % 2 == 1)
-        if pad_input:
-            x = nn.functional.pad(x, (0, 0, 0, W % 2, 0, H % 2, 0, D % 2))
-
-        D = x.shape[1]
-        H = x.shape[2]
-        W = x.shape[3]
-
-        x0 = x[:, 0::2, 0::2, 0::2, :]  # B D/2 H/2 W/2 C
-        x1 = x[:, 0::2, 0::2, 1::2, :]  # B D/2 H/2 W/2 C
-        x2 = x[:, 0::2, 1::2, 0::2, :]  # B D/2 H/2 W/2 C
-        x3 = x[:, 0::2, 1::2, 1::2, :]  # B D/2 H/2 W/2 C
-        x4 = x[:, 1::2, 0::2, 0::2, :]  # B D/2 H/2 W/2 C
-        x5 = x[:, 1::2, 0::2, 1::2, :]  # B D/2 H/2 W/2 C
-        x6 = x[:, 1::2, 1::2, 0::2, :]  # B D/2 H/2 W/2 C
-        x7 = x[:, 1::2, 1::2, 1::2, :]  # B D/2 H/2 W/2 C
-
-        x = torch.cat([x0, x1, x2, x3, x4, x5, x6, x7], -1)  # B D/2 H/2 W/2 8*C
-        x = x.view(B, -1, 8 * C)  
-
-
-class ConvLayer(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=0, dilation=1, groups=1,
-                 bias=True, dropout=0, norm=nn.BatchNorm2d, act=nn.ReLU):
-        super(ConvLayer, self).__init__()
-        self.dropout = nn.Dropout3d(dropout, inplace=False) if dropout > 0 else None
-        self.conv = nn.Conv3d(
+        # 2x downsample bằng conv stride 2
+        self.conv = nn.Conv2d(
             in_channels,
             out_channels,
-            kernel_size=(kernel_size, kernel_size),
-            stride=(stride, stride),
-            padding=(padding, padding),
-            dilation=(dilation, dilation),
-            groups=groups,
-            bias=bias,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=False,
         )
-        self.norm = norm(num_features=out_channels) if norm else None
-        self.act = act() if act else None
+        self.norm = norm_layer(out_channels)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.dropout is not None:
-            x = self.dropout(x)
-        x = self.conv(x)
-        if self.norm:
-            x = self.norm(x)
-        if self.act:
-            x = self.act(x)
+    def forward(self, x):  # x: (B, C_in, H, W)
+        x = self.conv(x)   # (B, C_out, H/2, W/2)
+        x = self.norm(x)
         return x
+
+
+class NeighborAttentionFusion(nn.Module):
+    def __init__(self,
+                 in_channels: int,
+                 num_neighbors: int = 2,
+                 reduction: int = 4,
+                 use_spatial: bool = True,
+                 out_channels: int = None):
+        super().__init__()
+        self.in_channels = in_channels
+        self.num_neighbors = num_neighbors
+        self.use_spatial = use_spatial
+
+        # K*C kênh sau khi ghép
+        fused_in = in_channels * num_neighbors
+
+        # Channel attention MLP
+        hidden = max(fused_in // reduction, 1)
+        self.mlp = nn.Sequential(
+            nn.Linear(fused_in, hidden, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, fused_in, bias=False)
+        )
+
+        # Spatial attention
+        if use_spatial:
+            self.spatial_conv = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
+            self.spatial_bn = nn.BatchNorm2d(1)
+        else:
+            self.spatial_conv = None
+            self.spatial_bn = None
+
+        # Output conv 1x1 fuse neighbors
+        if out_channels is None:
+            out_channels = in_channels
+        self.out_channels = out_channels
+
+        self.fuse_conv = nn.Conv2d(fused_in, out_channels, kernel_size=1, bias=False)
+        self.fuse_bn = nn.BatchNorm2d(out_channels)
+        self.fuse_act = nn.ReLU(inplace=True)
+
+    def forward(self, x_neighbors: torch.Tensor) -> torch.Tensor:
+        """
+        x_neighbors: (B, K, H, W, C)
+        Return:
+            x_fused: (B, H, W, C_fused)
+        """
+        B, K, H, W, C = x_neighbors.shape
+
+        assert K == self.num_neighbors, f"Expected {self.num_neighbors} neighbors, got {K}"
+        assert C == self.in_channels, f"Expected in_channels={self.in_channels}, got {C}"
+
+
+        # (B,K,H,W,C) -> (B,K,C,H,W) -> (B,K*C,H,W)
+        x = x_neighbors.permute(0, 1, 4, 2, 3).contiguous()
+        x = x.view(B, K * C, H, W)
+
+        # Channel attention
+        avg_pool = F.adaptive_avg_pool2d(x, 1).view(B, K * C)
+        max_pool = F.adaptive_max_pool2d(x, 1).view(B, K * C)
+
+        avg_weight = self.mlp(avg_pool)
+        max_weight = self.mlp(max_pool)
+
+        channel_att = torch.sigmoid(avg_weight + max_weight).view(B, K * C, 1, 1)
+        x = x * channel_att
+
+        # Spatial attention
+        if self.use_spatial and self.spatial_conv is not None:
+            avg_pool_sp = torch.mean(x, dim=1, keepdim=True)          # (B,1,H,W)
+            max_pool_sp, _ = torch.max(x, dim=1, keepdim=True)        # (B,1,H,W)
+            sp = torch.cat([avg_pool_sp, max_pool_sp], dim=1)         # (B,2,H,W)
+
+            spatial_att = self.spatial_conv(sp)
+            spatial_att = self.spatial_bn(spatial_att)
+            spatial_att = torch.sigmoid(spatial_att)
+            x = x * spatial_att
+
+        # Fuse neighbors bằng conv 1x1
+        x = self.fuse_conv(x)
+        x = self.fuse_bn(x)
+        x = self.fuse_act(x)
+
+        # (B, C_fused, H, W) -> (B, H, W, C_fused)
+        x = x.permute(0, 2, 3, 1).contiguous()
+        return x
+
+
+
+
