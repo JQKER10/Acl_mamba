@@ -10,9 +10,10 @@ from tqdm import tqdm
 
 class Seg2p5DMedicalDataset(Dataset):
     """
-    Dataset 2.5D:
+    Dataset 2.5D với PADDING để mọi slice đều có đủ neighbors:
     - Đầu vào từ NNUnet-style: .npy, _seg.npy, .pkl
     - Trả ra từng sample theo lát z: center + neighbors + mask center.
+    - Xử lý edge cases bằng reflection/replication padding
     
     Giả định:
     - image.npy: (C, D, H, W)
@@ -27,6 +28,7 @@ class Seg2p5DMedicalDataset(Dataset):
         use_properties: bool = True,
         cache_volumes: bool = False,   # cache cả volume vào RAM (nếu dataset nhỏ)
         preprocess_fn: Optional[callable] = None,  # augment/normalize, v.v.
+        padding_mode: str = "reflect",  # 'reflect', 'replicate', 'zero'
     ) -> None:
         super().__init__()
 
@@ -39,6 +41,7 @@ class Seg2p5DMedicalDataset(Dataset):
         self.preprocess_fn = preprocess_fn
         self.K = neighbor_slices
         self.half = self.K // 2
+        self.padding_mode = padding_mode
 
         # 1) validate file tồn tại
         self._validate_files()
@@ -73,8 +76,8 @@ class Seg2p5DMedicalDataset(Dataset):
 
             self.volume_shapes.append((C, D, H, W))
 
-            # tạo samples slice-level (bỏ biên để đủ neighbor hai bên)
-            for z in range(self.half, D - self.half):
+            # ===== THAY ĐỔI: Lấy TẤT CẢ slices, không bỏ biên =====
+            for z in range(D):
                 self.samples.append((case_idx, z))
 
         # 4) optional: cache full volume image+seg vào RAM
@@ -87,6 +90,7 @@ class Seg2p5DMedicalDataset(Dataset):
 
         print(f"Seg2p5DMedicalDataset initialized with {len(self.samples)} slice samples "
               f"from {len(self.datalist)} volumes.")
+        print(f"Padding mode: {self.padding_mode}")
 
     # ---------- helper functions ----------
 
@@ -161,6 +165,57 @@ class Seg2p5DMedicalDataset(Dataset):
             # seg: (D,H,W)
             return vol[z, :, :]
 
+    def _get_neighbor_index(self, z: int, offset: int, D: int) -> int:
+        """
+        Tính index của neighbor slice với padding strategy
+        
+        Args:
+            z: center slice index
+            offset: offset từ center (-half đến +half, trừ 0)
+            D: tổng số slices trong volume
+        
+        Returns:
+            z_neighbor: index của neighbor slice (đã xử lý boundary)
+        """
+        z_n = z + offset
+        
+        if self.padding_mode == "reflect":
+            # Reflection padding: 0 1 2 3 → 3 2 1 | 0 1 2 3 | 2 1 0
+            if z_n < 0:
+                z_n = -z_n  # reflect từ boundary trái
+            elif z_n >= D:
+                z_n = 2 * D - z_n - 2  # reflect từ boundary phải
+            z_n = np.clip(z_n, 0, D - 1)  # ensure in bounds
+            
+        elif self.padding_mode == "replicate":
+            # Replication padding: 0 0 0 | 0 1 2 3 | 3 3 3
+            z_n = np.clip(z_n, 0, D - 1)
+            
+        elif self.padding_mode == "zero":
+            # Zero padding: sẽ trả về slice zero nếu out of bounds
+            # (xử lý trong _get_slice_safe)
+            pass
+        
+        else:
+            raise ValueError(f"Unknown padding mode: {self.padding_mode}")
+        
+        return z_n
+
+    def _get_slice_safe(self, vol: np.ndarray, z: int, D: int):
+        """
+        Get slice với xử lý zero padding nếu z out of bounds
+        """
+        if z < 0 or z >= D:
+            # Return zero slice
+            if vol.ndim == 4:
+                C, _, H, W = vol.shape
+                return np.zeros((C, H, W), dtype=vol.dtype)
+            else:
+                _, H, W = vol.shape
+                return np.zeros((H, W), dtype=vol.dtype)
+        else:
+            return self._get_slice(vol, z)
+
     # ---------- Dataset API ----------
 
     def __len__(self) -> int:
@@ -176,30 +231,46 @@ class Seg2p5DMedicalDataset(Dataset):
         else:
             img_vol, seg_vol = self._read_volume_mmap(data_path)
 
-        # 2) lấy center + neighbors
-        # center
+        # Get depth dimension
+        if img_vol.ndim == 4:
+            C, D, H, W = img_vol.shape
+        else:
+            D, H, W = img_vol.shape
+            C = 1
+
+        # 2) lấy center
         center_img = self._get_slice(img_vol, z)          # (C,H,W)
         center_seg = None if self.test else self._get_slice(seg_vol, z)  # (H,W)
 
-        # neighbors
+        # 3) lấy neighbors với padding
         neighbor_slices = []
         for offset in range(-self.half, self.half + 1):
             if offset == 0:
                 continue
-            z_n = z + offset
-            neighbor_slices.append(self._get_slice(img_vol, z_n))  # (C,H,W)
+            
+            # ===== THAY ĐỔI: Xử lý boundary với padding =====
+            if self.padding_mode == "zero":
+                # Zero padding: trả về zero slice nếu out of bounds
+                z_n = z + offset
+                neighbor_slice = self._get_slice_safe(img_vol, z_n, D)
+            else:
+                # Reflect/Replicate padding
+                z_n = self._get_neighbor_index(z, offset, D)
+                neighbor_slice = self._get_slice(img_vol, z_n)
+            
+            neighbor_slices.append(neighbor_slice)  # (C,H,W)
+        
         neighbors = np.stack(neighbor_slices, axis=0)  # (K, C, H, W)
 
-        # 3) chuyển sang torch (đây là chỗ quan trọng để tăng tốc CPU→GPU)
-        center_img = torch.from_numpy(center_img).float().contiguous()       # (C,H,W)
-        neighbors = torch.from_numpy(neighbors).float().contiguous()         # (K,C,H,W)
+        # 4) chuyển sang torch
+        center_img = torch.from_numpy(center_img.copy()).float().contiguous()       # (C,H,W)
+        neighbors = torch.from_numpy(neighbors.copy()).float().contiguous()         # (K,C,H,W)
         if center_seg is not None:
-            center_seg = torch.from_numpy(center_seg).long().contiguous()    # (H,W)
+            center_seg = torch.from_numpy(center_seg.copy()).long().contiguous()    # (H,W)
 
         properties = self.properties_cached[case_idx] if self.use_properties else None
 
-        # 4) preprocess/augment (nếu có), chạy trên CPU
-        #    preprocess_fn cần nhận & trả tensor (không phải numpy) cho tiện
+        # 5) preprocess/augment (nếu có)
         if self.preprocess_fn is not None:
             center_img, neighbors, center_seg = self.preprocess_fn(
                 center_img, neighbors, center_seg

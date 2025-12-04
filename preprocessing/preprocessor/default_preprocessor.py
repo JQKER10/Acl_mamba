@@ -419,52 +419,73 @@ class TwoStagePreprocessor2_5D:
         return processed_volume, processed_seg, bboxes
     
     def _process_with_perslice_crop(
-        self, 
-        volume: np.ndarray, 
-        seg: Optional[np.ndarray], 
-        spacing_zyx: Tuple[float, float, float]
-    ) -> Tuple[np.ndarray, Optional[np.ndarray], List]:
+    self, 
+    volume: np.ndarray, 
+    seg: Optional[np.ndarray], 
+    spacing_zyx: Tuple[float, float, float]
+) -> Tuple[np.ndarray, Optional[np.ndarray], List]:
         """
-        Process với per-slice crop (variable shapes)
+        Process với per-slice crop (variable shapes) + PAD về cùng H×W
         """
+        FIX_H, FIX_W = 256, 256
         D = volume.shape[0]
-        
+
         processed_slices: List[np.ndarray] = []
         processed_seg_slices: Optional[List[np.ndarray]] = [] if seg is not None else None
         bboxes: List[Tuple[int, int, int, int]] = []
-        
+
+        # ---- Helper: Resize về 256x256 ----
+        from scipy.ndimage import zoom
+        def resize_to_fixed(arr: np.ndarray, H_fix: int, W_fix: int, is_label: bool = False):
+            h, w = arr.shape
+            zoom_y = H_fix / h
+            zoom_x = W_fix / w
+            order = 0 if is_label else 3     # nearest for label, cubic for image
+            return zoom(arr, (zoom_y, zoom_x), order=order)
+
+        # ---- 1. Crop + resample từng slice ----
         for z in range(D):
             slice_img = volume[z]
-            
+
             # Crop per-slice
             cropped_img, bbox = self.crop_to_nonzero_2d(slice_img)
             bboxes.append(bbox)
-            
-            # Resample in-plane
+
+            # Resample in-plane theo spacing
             resampled_img = self.resample_slice_inplane(
                 cropped_img,
                 current_spacing=(spacing_zyx[1], spacing_zyx[2]),
                 is_label=False,
             )
-            processed_slices.append(resampled_img)
-            
-            # Process seg
+
+            # Resize cố định về 256×256
+            resized_img = resize_to_fixed(resampled_img, FIX_H, FIX_W, is_label=False)
+            processed_slices.append(resized_img)
+
+            # Seg
             if seg is not None:
                 y_min, y_max, x_min, x_max = bbox
                 cropped_seg = seg[z, y_min:y_max, x_min:x_max]
-                
+
                 resampled_seg = self.resample_slice_inplane(
                     cropped_seg,
                     current_spacing=(spacing_zyx[1], spacing_zyx[2]),
                     is_label=True,
                 )
-                processed_seg_slices.append(resampled_seg)
-        
-        # Stack slices (shapes có thể khác nhau - will handle in collate_fn)
-        processed_volume = np.stack(processed_slices, axis=0)
-        processed_seg = np.stack(processed_seg_slices, axis=0) if processed_seg_slices else None
-        
+
+                resized_seg = resize_to_fixed(resampled_seg, FIX_H, FIX_W, is_label=True)
+                processed_seg_slices.append(resized_seg)
+
+        # ---- 2. Stack thành (D, 256, 256) ----
+        processed_volume = np.stack(processed_slices, axis=0).astype(np.float32)
+
+        if processed_seg_slices is not None:
+            processed_seg = np.stack(processed_seg_slices, axis=0).astype(np.uint8)
+        else:
+            processed_seg = None
+
         return processed_volume, processed_seg, bboxes
+
     
     # ==================== SAVE RESULTS ====================
     

@@ -1,0 +1,50 @@
+# Data
+'data_dir': './data',
+'img_size': 256,
+'num_slices': 3,  # 2.5D: 3 slices (prev, current, next)
+'in_channels': 3,  # Tương ứng với num_slices
+'num_classes': ...,  # Binary hoặc multi-class
+'batch_size': 16,
+'num_workers': 4,
+
+# Model
+'model_name': 'acl_mamba',
+'features': [64, 128, 256, 512],
+'dstate': 64,
+'d_model': 256,
+'num_heads': 16,
+'ngroups': 1,
+
+# Training
+'epochs': 200,
+'learning_rate': 1e-4,
+'weight_decay': 1e-5,
+'loss_type': 'combined',  # 'dice', 'focal', 'combined', 'dice_ce'
+
+# Scheduler
+'T_0': 10,
+'T_mult': 2,
+'min_lr': 1e-6,
+
+# Optimization
+'use_amp': True,  # Mixed precision
+'multi_gpu': False,
+
+# Augmentation
+'augmentation': True,
+
+# Callbacks
+'early_stop_patience': 30,
+'save_freq': 10,  # Save every N epochs
+
+# Paths
+'checkpoint_dir': './checkpoints',
+'log_dir': './logs',
+'result_dir': './results',
+
+# Logging
+'use_wandb': False,  # Set True để dùng Weights & Biases
+'project_name': 'segmentation_25d',
+
+# Resume
+'resume': None,  # Path to checkpoint to resume training from
