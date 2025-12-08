@@ -15,10 +15,6 @@ from albumentations.core.transforms_interface import ImageOnlyTransform
 class RicianNoise(ImageOnlyTransform):
     """
     Mô phỏng nhiễu Rician đặc trưng của MRI.
-    Công thức: I_out = sqrt((I + N1)^2 + N2^2)
-    
-    Attributes:
-        noise_limit (Tuple[float, float]): Phạm vi variance của nhiễu.
     """
     def __init__(
         self, 
@@ -30,18 +26,15 @@ class RicianNoise(ImageOnlyTransform):
         self.noise_limit = noise_limit
 
     def apply(self, img: np.ndarray, **params) -> np.ndarray:
-        # img shape: (H, W, C), values: [0, 1] usually
+        # img shape: (H, W, Total_Channels)
         variance = np.random.uniform(self.noise_limit[0], self.noise_limit[1])
         sigma = np.sqrt(variance)
         
-        # Tạo 2 mẫu nhiễu Gaussian độc lập
         n1 = np.random.normal(0, sigma, img.shape)
         n2 = np.random.normal(0, sigma, img.shape)
         
-        # Áp dụng công thức Rician
         img_rician = np.sqrt((img + n1) ** 2 + n2 ** 2)
         
-        # Đảm bảo dtype và range không thay đổi
         return np.clip(img_rician, 0, 1).astype(img.dtype)
 
     def get_transform_init_args_names(self):
@@ -50,11 +43,9 @@ class RicianNoise(ImageOnlyTransform):
 
 class SimulateRegistrationError(ImageOnlyTransform):
     """
-    Mô phỏng lỗi lệch ghép kênh (Channel Misalignment/Translation).
-    Dịch chuyển ngẫu nhiên các slice (channels) độc lập với nhau.
-    
-    Attributes:
-        shift_limit (int): Số pixel tối đa dịch chuyển theo trục x, y.
+    Mô phỏng lỗi lệch ghép kênh.
+    Lưu ý: Với 2.5D Stack, transform này sẽ làm lệch các neighbor so với center
+    một cách ngẫu nhiên -> Tăng tính mạnh mẽ (Robustness).
     """
     def __init__(
         self, 
@@ -69,15 +60,11 @@ class SimulateRegistrationError(ImageOnlyTransform):
         h, w, c = img.shape
         img_shifted = np.empty_like(img)
         
-        # Dịch chuyển từng kênh riêng biệt
         for i in range(c):
             dx = random.randint(-self.shift_limit, self.shift_limit)
             dy = random.randint(-self.shift_limit, self.shift_limit)
             
-            # Sử dụng Affine matrix để dịch chuyển
             M = np.float32([[1, 0, dx], [0, 1, dy]])
-            
-            # BORDER_REFLECT_101 giúp biên ảnh mượt hơn khi dịch chuyển
             img_shifted[:, :, i] = cv2.warpAffine(
                 img[:, :, i], M, (w, h), 
                 borderMode=cv2.BORDER_REFLECT_101
@@ -95,8 +82,8 @@ class SimulateRegistrationError(ImageOnlyTransform):
 
 class Medical2p5DTransform:
     """
-    Pipeline Augmentation chuyên dụng cho dữ liệu Y tế 2.5D (Stack slices).
-    Input: Tensor (C, H, W) -> Output: Tensor (C, H, W)
+    Pipeline Augmentation chuyên dụng cho dữ liệu Y tế 2.5D.
+    Hỗ trợ input từ Dataset: Center (C,H,W) + Neighbors (K,C,H,W).
     """
     def __init__(
         self, 
@@ -116,12 +103,10 @@ class Medical2p5DTransform:
             self.transform = self._get_val_pipeline()
 
     def _get_spatial_transforms(self) -> List[Any]:
-        """Nhóm biến đổi hình học (Geometric): Xoay, lật, méo."""
         return [
             A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.5), # Tùy chọn, tốt cho MRI đầu gối/cột sống
+            A.VerticalFlip(p=0.5),
             
-            # Affine thay thế cho ShiftScaleRotate (mạnh mẽ hơn)
             A.Affine(
                 scale=(0.85, 1.15),
                 translate_percent=(0, 0.05),
@@ -131,7 +116,6 @@ class Medical2p5DTransform:
                 p=0.5
             ),
             
-            # Biến dạng đàn hồi (Elastic/Grid) - Rất quan trọng cho mô mềm
             A.OneOf([
                 A.GridDistortion(num_steps=5, distort_limit=0.3, p=1.0),
                 A.ElasticTransform(
@@ -142,10 +126,10 @@ class Medical2p5DTransform:
                 ),
             ], p=0.3),
 
-            # Giả lập lỗi ghép kênh (Registration Error)
+            # Simulation error chỉ nên tác động nhẹ, nếu dataset neighbors
+            # đã được align chuẩn thì cái này giả lập chuyển động bệnh nhân tốt
             SimulateRegistrationError(shift_limit=3, p=0.2),
             
-            # CoarseDropout - Giả lập mất thông tin cục bộ
             A.CoarseDropout(
                 max_holes=8,
                 max_height=int(self.image_size / 10),
@@ -155,18 +139,11 @@ class Medical2p5DTransform:
         ]
 
     def _get_pixel_transforms(self) -> List[Any]:
-        """Nhóm biến đổi pixel (Intensity/Noise): Màu sắc, độ sáng, nhiễu."""
         return [
-            # 1. Intensity Corrections
-            A.RandomBrightnessContrast(
-                brightness_limit=0.2, 
-                contrast_limit=0.2, 
-                p=0.3
-            ),
+            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
             A.RandomGamma(gamma_limit=(80, 120), p=0.3),
             A.MultiplicativeNoise(multiplier=(0.9, 1.1), elementwise=True, p=0.2),
             
-            # 2. Noise Injection
             A.OneOf([
                 A.GaussNoise(var_limit=(0.001, 0.01), p=1.0),
                 RicianNoise(noise_limit=(0.001, 0.01), p=1.0),
@@ -176,11 +153,11 @@ class Medical2p5DTransform:
         ]
 
     def _get_train_pipeline(self) -> A.Compose:
-        """Tổng hợp pipeline cho training."""
         transforms_list = (
             self._get_spatial_transforms() + 
             self._get_pixel_transforms() + 
             [
+                # Mean/Std sẽ tự broadcast nếu số channel > len(mean)
                 A.Normalize(mean=self.mean, std=self.std, max_pixel_value=1.0),
                 ToTensorV2()
             ]
@@ -188,7 +165,6 @@ class Medical2p5DTransform:
         return A.Compose(transforms_list)
 
     def _get_val_pipeline(self) -> A.Compose:
-        """Tổng hợp pipeline cho validation (chỉ Normalize)."""
         return A.Compose([
             A.Normalize(mean=self.mean, std=self.std, max_pixel_value=1.0),
             ToTensorV2()
@@ -196,44 +172,65 @@ class Medical2p5DTransform:
 
     def __call__(
         self, 
-        img_tensor: torch.Tensor, 
-        mask_tensor: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        center_img: torch.Tensor, 
+        neighbors: torch.Tensor,
+        center_seg: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
-        Thực thi transform.
+        Thực thi transform đồng bộ cho Center và Neighbors.
         
         Args:
-            img_tensor: Input Image Tensor (C, H, W).
-            mask_tensor: Input Mask Tensor (H, W) hoặc None.
+            center_img: (C, H, W)
+            neighbors:  (K, C, H, W)
+            center_seg: (H, W) hoặc None
             
         Returns:
-            Tuple[img_aug, mask_aug]
+            Tuple[center_aug, neighbors_aug, mask_aug]
         """
-        # 1. Tensor (C, H, W) -> Numpy (H, W, C)
-        # Permute để đưa Channels về cuối phục vụ Albumentations
-        img_np = img_tensor.permute(1, 2, 0).numpy().astype(np.float32)
+        # 0. Lưu lại shape gốc để restore sau này
+        C, H, W = center_img.shape
+        K = neighbors.shape[0] # Số lượng neighbors
 
-        # 2. Mask Handling
+        # 1. Stack Center và Neighbors thành 1 khối (Channel Stacking)
+        # neighbors (K, C, H, W) -> flatten -> (K*C, H, W)
+        neighbors_flat = neighbors.view(-1, H, W) 
+        
+        # full_vol: (C + K*C, H, W)
+        full_vol = torch.cat([center_img, neighbors_flat], dim=0)
+
+        # 2. Convert sang Numpy (H, W, Total_Channels) cho Albumentations
+        img_np = full_vol.permute(1, 2, 0).numpy().astype(np.float32)
+
+        # 3. Mask Handling
         mask_np = None
-        if mask_tensor is not None:
-            mask_np = mask_tensor.numpy().astype(np.float32)
+        if center_seg is not None:
+            mask_np = center_seg.numpy().astype(np.float32)
 
-        # 3. Apply Transform Pipeline
+        # 4. Apply Transform Pipeline
+        # Albumentations sẽ xử lý toàn bộ các kênh trong img_np với cùng một phép biến đổi hình học
         if mask_np is not None:
-            # Albumentations tự động xử lý mask cho Spatial Transforms
-            # và bỏ qua mask cho Pixel Transforms -> Rất an toàn
             augmented = self.transform(image=img_np, mask=mask_np)
-            img_aug = augmented['image']
-            mask_aug = augmented['mask'].long() # Mask segmentation cần kiểu Long/Int64
+            img_aug = augmented['image']          # Tensor (Total_Channels, H, W)
+            mask_aug = augmented['mask'].long()   # Tensor (H, W)
         else:
             augmented = self.transform(image=img_np)
             img_aug = augmented['image']
             mask_aug = None
 
-        return img_aug, mask_aug
+        # 5. Unstack (Tách lại Center và Neighbors)
+        # img_aug: (Total_Channels, H, W)
+        
+        # Lấy lại phần center (C channels đầu tiên)
+        center_img_aug = img_aug[:C, :, :]
+        
+        # Lấy lại phần neighbors (phần còn lại)
+        neighbors_flat_aug = img_aug[C:, :, :]
+        
+        # Reshape lại neighbors về (K, C, H, W)
+        neighbors_aug = neighbors_flat_aug.view(K, C, H, W)
+
+        return center_img_aug, neighbors_aug, mask_aug
 
     def __repr__(self):
-        """String representation cho debugging."""
         mode = "Train" if self.is_train else "Val"
         return f"Medical2p5DTransform(mode={mode}, size={self.image_size})"
-
