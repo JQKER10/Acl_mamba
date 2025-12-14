@@ -9,40 +9,6 @@ from albumentations.pytorch import ToTensorV2
 
 # --- Custom Transforms ---
 
-class IndependentRegistrationError:
-    """
-    Mô phỏng lỗi lệch kênh (Channel Misalignment) - thường gặp trong MRI/CT ghép lớp.
-    Xử lý độc lập trên từng channel trước khi stack vào pipeline chính.
-    """
-    def __init__(self, shift_limit: int = 3, p: float = 0.5):
-        self.shift_limit = shift_limit
-        self.p = p
-
-    def __call__(self, img: np.ndarray) -> np.ndarray:
-        if random.random() > self.p:
-            return img
-
-        h, w, c = img.shape
-        img_shifted = np.empty_like(img)
-        
-        # Shift từng channel riêng biệt
-        for i in range(c):
-            dx = random.randint(-self.shift_limit, self.shift_limit)
-            dy = random.randint(-self.shift_limit, self.shift_limit)
-            
-            if dx == 0 and dy == 0:
-                img_shifted[..., i] = img[..., i]
-            else:
-                M = np.float32([[1, 0, dx], [0, 1, dy]])
-                # Dùng reflect để tránh viền đen khi dịch ảnh
-                img_shifted[..., i] = cv2.warpAffine(
-                    img[..., i], M, (w, h), 
-                    borderMode=cv2.BORDER_REFLECT_101
-                )
-                
-        return img_shifted
-
-
 class RicianNoise(A.ImageOnlyTransform):
     """Giả lập nhiễu Rician đặc trưng của Medical Imaging."""
     def __init__(self, noise_limit: Tuple[float, float] = (0.01, 0.05), always_apply=False, p=0.5):
@@ -82,7 +48,6 @@ class Medical2p5DTransform:
         self.use_normalization = use_normalization
 
         # Augmentation components
-        self.reg_error = IndependentRegistrationError(shift_limit=4, p=0.3)
         self.spatial_transform = self._build_spatial() if is_train else None
         self.pixel_transform = self._build_pixel() if is_train else None
         self.final_transform = self._build_final()
@@ -174,9 +139,6 @@ class Medical2p5DTransform:
 
         # 2. Training Augmentation Flow
         if self.is_train:
-            # Custom registration error (chạy riêng vì logic channel độc lập)
-            img_np = self.reg_error(img_np)
-
             # Spatial transforms (apply lên cả ảnh và mask)
             if mask_np is not None:
                 augmented = self.spatial_transform(image=img_np, mask=mask_np)
@@ -208,4 +170,3 @@ class Medical2p5DTransform:
     def __repr__(self):
         mode = "Train" if self.is_train else "Val"
         return f"Medical2p5DTransform(mode={mode}, size={self.image_size}, norm={self.use_normalization})"
-
