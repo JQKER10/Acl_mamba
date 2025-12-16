@@ -22,7 +22,6 @@ class RicianNoise(A.ImageOnlyTransform):
         n1 = np.random.normal(0, sigma, img.shape)
         n2 = np.random.normal(0, sigma, img.shape)
         
-        # Công thức Rician: sqrt((img + n1)^2 + n2^2)
         img_rician = np.sqrt((img + n1) ** 2 + n2 ** 2)
         return np.clip(img_rician, 0, 1).astype(img.dtype)
 
@@ -53,14 +52,14 @@ class Medical2p5DTransform:
         self.final_transform = self._build_final()
 
     def _build_spatial(self) -> A.Compose:
-        """Geometric transforms: Rot, Scale, Distortion..."""
+
         return A.Compose([
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
             
             A.Affine(
                 scale=(0.85, 1.15),
-                translate_percent=(0, 0.05),
+                translate_percent=(-0.05, 0.05), # Dịch chuyển cả 2 chiều
                 rotate=(-15, 15),
                 interpolation=cv2.INTER_LINEAR,
                 mask_interpolation=cv2.INTER_NEAREST, 
@@ -119,7 +118,7 @@ class Medical2p5DTransform:
         neighbors: torch.Tensor,
         center_seg: Optional[torch.Tensor] = None
     ):
-        # Detach về CPU để xử lý bằng numpy/opencv
+        # Detach về CPU để xử lý
         if isinstance(center_img, torch.Tensor): center_img = center_img.detach().cpu()
         if isinstance(neighbors, torch.Tensor): neighbors = neighbors.detach().cpu()
             
@@ -131,42 +130,54 @@ class Medical2p5DTransform:
         full_vol = torch.cat([center_img, neighbors_flat], dim=0)
         img_np = full_vol.permute(1, 2, 0).numpy().astype(np.float32)
 
-        # Chuẩn bị mask (Albumentations cần mask dạng int)
+       
+        img_np = np.nan_to_num(img_np, nan=0.0, posinf=None, neginf=None)
+
+     
+        _min = img_np.min()
+        _max = img_np.max()
+        if _max - _min > 1e-5:
+            img_np = (img_np - _min) / (_max - _min)
+        else:
+            img_np = np.zeros_like(img_np)
+       
         mask_np = None
         if center_seg is not None:
             if isinstance(center_seg, torch.Tensor): center_seg = center_seg.detach().cpu()
             mask_np = center_seg.numpy().astype(np.int32) 
 
-        # 2. Training Augmentation Flow
+        # 2. Augmentation Flow
         if self.is_train:
-            # Spatial transforms (apply lên cả ảnh và mask)
             if mask_np is not None:
                 augmented = self.spatial_transform(image=img_np, mask=mask_np)
                 img_np, mask_np = augmented['image'], augmented['mask']
             else:
                 img_np = self.spatial_transform(image=img_np)['image']
 
-            # Pixel transforms (chỉ apply lên ảnh)
             img_np = self.pixel_transform(image=img_np)['image']
 
-        # 3. Finalize (Normalize -> Tensor)
+        # 3. Finalize
         if mask_np is not None:
             final = self.final_transform(image=img_np, mask=mask_np)
             img_tensor = final['image']
-            mask_tensor = final['mask'].long() # Về lại Long cho Loss function
+            mask_tensor = final['mask'].long()
         else:
             final = self.final_transform(image=img_np)
             img_tensor = final['image']
             mask_tensor = None
+            
+        # Kiểm tra an toàn lần cuối
+        if torch.isnan(img_tensor).any():
+            img_tensor = torch.nan_to_num(img_tensor, nan=0.0)
 
         # 4. Unstack channels
-        # Tách lại center và neighbors theo đúng thứ tự ban đầu
         center_img_aug = img_tensor[:C, ...]
         neighbors_flat_aug = img_tensor[C:, ...]
-        neighbors_aug = neighbors_flat_aug.view(K, C, H, W)
+        neighbors_aug = neighbors_flat_aug.view(K, C, H, W) # Giữ nguyên H, W
 
         return center_img_aug, neighbors_aug, mask_tensor
 
     def __repr__(self):
         mode = "Train" if self.is_train else "Val"
         return f"Medical2p5DTransform(mode={mode}, size={self.image_size}, norm={self.use_normalization})"
+
